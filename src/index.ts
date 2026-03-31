@@ -5,7 +5,9 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   DEFAULT_TRIGGER,
+  GATEWAY_PORT,
   getTriggerPattern,
   GROUPS_DIR,
   IDLE_TIMEOUT,
@@ -45,9 +47,10 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
 } from './db.js';
+import { GatewayChannel, startGatewayServer } from './gateway-server.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -83,13 +86,13 @@ function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
   if (group.isMain) return;
   const identifier = group.folder.toLowerCase().replace(/_/g, '-');
   onecli.ensureAgent({ name: group.name, identifier }).then(
-    (res) => {
+    (res: { created: boolean }) => {
       logger.info(
         { jid, identifier, created: res.created },
         'OneCLI agent ensured',
       );
     },
-    (err) => {
+    (err: unknown) => {
       logger.debug(
         { jid, identifier, err: String(err) },
         'OneCLI agent ensure skipped',
@@ -142,21 +145,11 @@ function saveState(): void {
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
-  let groupDir: string;
-  try {
-    groupDir = resolveGroupFolderPath(group.folder);
-  } catch (err) {
-    logger.warn(
-      { jid, folder: group.folder, err },
-      'Rejecting group registration with invalid folder',
-    );
-    return;
-  }
-
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 
   // Create group folder
+  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
   // Copy CLAUDE.md template into the new group folder so agents have
@@ -300,10 +293,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       resetIdleTimer();
     }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
-
     if (result.status === 'error') {
       hadError = true;
     }
@@ -390,7 +379,6 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
-        assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -560,13 +548,9 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
+async function main(): Promise<void> {
   ensureContainerRuntimeRunning();
   cleanupOrphans();
-}
-
-async function main(): Promise<void> {
-  ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -580,10 +564,12 @@ async function main(): Promise<void> {
   restoreRemoteControl();
 
   // Graceful shutdown handlers
+  let gatewayServer: import('http').Server;
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
+    gatewayServer?.close();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -687,10 +673,46 @@ async function main(): Promise<void> {
     channels.push(channel);
     await channel.connect();
   }
+
+  // Gateway channel — virtual channel for shared Telegram bot routing
+  const gatewayChannel = new GatewayChannel();
+  channels.push(gatewayChannel);
+  await gatewayChannel.connect();
+
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
   }
+
+  // Shared sendMessage helper used by subsystems
+  const sendMessage = async (jid: string, rawText: string): Promise<void> => {
+    const channel = findChannel(channels, jid);
+    if (!channel) {
+      logger.warn({ jid }, 'No channel owns JID, cannot send message');
+      return;
+    }
+    const text = formatOutbound(rawText);
+    if (text) await channel.sendMessage(jid, text);
+  };
+
+  // Start gateway server (shared Telegram bot message routing)
+  gatewayServer = startGatewayServer(GATEWAY_PORT, {
+    storeMessage: storeMessageDirect,
+    storeChatMetadata,
+    ensureGroup: (jid: string, clientSlug: string) => {
+      if (!registeredGroups[jid]) {
+        registerGroup(jid, {
+          name: clientSlug,
+          folder: `gw-${clientSlug}`,
+          trigger: `^@${ASSISTANT_NAME}`,
+          added_at: new Date().toISOString(),
+          requiresTrigger: false, // Gateway messages always trigger processing
+        });
+      }
+    },
+    enqueueMessage: (jid: string) => queue.enqueueMessageCheck(jid),
+    pipeMessage: (jid: string, formatted: string) => queue.sendMessage(jid, formatted),
+  });
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -699,15 +721,7 @@ async function main(): Promise<void> {
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
-    sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
-        return;
-      }
-      const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
-    },
+    sendMessage,
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
@@ -746,10 +760,7 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
-  startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
-    process.exit(1);
-  });
+  startMessageLoop();
 }
 
 // Guard: only run when executed directly, not when imported by tests

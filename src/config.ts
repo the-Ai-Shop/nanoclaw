@@ -1,4 +1,3 @@
-import os from 'os';
 import path from 'path';
 
 import { readEnvFile } from './env.js';
@@ -10,6 +9,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_HAS_OWN_NUMBER',
   'ONECLI_URL',
   'TZ',
+  'GATEWAY_PORT',
 ]);
 
 export const ASSISTANT_NAME =
@@ -22,7 +22,7 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
-const HOME_DIR = process.env.HOME || os.homedir();
+const HOME_DIR = process.env.HOME || '/Users/user';
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
@@ -95,3 +95,9 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+
+// Gateway server (shared Telegram bot message routing)
+export const GATEWAY_PORT = parseInt(
+  process.env.GATEWAY_PORT || envConfig.GATEWAY_PORT || '3333',
+  10,
+);
